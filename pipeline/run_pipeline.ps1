@@ -255,7 +255,8 @@ Invoke-Step "Upload to R2" {
         --publish-dir    $CFG.PublishDir `
         --bucket         $CFG.R2Bucket `
         --endpoint       $CFG.R2Endpoint `
-        --month          $Month
+        --month          $Month `
+        --no-merge
 }
 
 # ---------------------------------------------------------------------------
@@ -269,7 +270,16 @@ Invoke-Step "Generate JSON" {
 }
 
 # ---------------------------------------------------------------------------
-# 6. GIT PUSH
+# 6. GENERATE ELUSIVE JSON
+# ---------------------------------------------------------------------------
+Invoke-Step "Generate Elusive JSON" {
+    & $CFG.PythonExe "$($CFG.ScriptsDir)\generate_elusive_json.py" `
+        --base-dir    $CFG.CalibratedDir `
+        --output-dir  "$ROOT\elusive_output\data"
+}
+
+# ---------------------------------------------------------------------------
+# 7. GIT PUSH (main dashboard)
 # ---------------------------------------------------------------------------
 Invoke-Step "Git push" {
     Push-Location $CFG.RepoDir
@@ -283,6 +293,28 @@ Invoke-Step "Git push" {
             Log-Info "Pushed to GitHub"
         } else {
             Log-Info "No changes to commit"
+        }
+    } finally {
+        Pop-Location
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 8. GIT PUSH (Elusive dashboard)
+# ---------------------------------------------------------------------------
+Invoke-Step "Git push Elusive" {
+    $ElusiveRepoDir = "$ROOT\elusive_output"
+    Push-Location $ElusiveRepoDir
+    try {
+        & $CFG.GitExe add "data/history.geojson" "data/latest.json"
+        $status = & $CFG.GitExe status --porcelain
+        if ($status) {
+            $msg = "auto: elusive data $(Get-Date -f 'yyyy-MM-dd HH:mm') UTC"
+            & $CFG.GitExe commit -m $msg
+            & $CFG.GitExe push origin main
+            Log-Info "Pushed Elusive to GitHub"
+        } else {
+            Log-Info "No Elusive changes to commit"
         }
     } finally {
         Pop-Location

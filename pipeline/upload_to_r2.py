@@ -286,6 +286,8 @@ def main():
     parser.add_argument("--bucket",         required=True)
     parser.add_argument("--endpoint",       required=True)
     parser.add_argument("--month",          required=True, help="YYYY-MM")
+    parser.add_argument("--no-merge",       action="store_true",
+                        help="Skip downloading existing R2 data; overwrite monthly file with new rows only")
     args = parser.parse_args()
 
     calibrated_dir = Path(args.calibrated_dir)
@@ -322,22 +324,25 @@ def main():
         # ── Monthly file ──────────────────────────────────────────────────────
         monthly_key = f"monthly/{sid}/{sid}_{year}_{mon}.csv"
 
-        # Download whatever is already in R2 for this sensor/month
-        print(f"    Fetching existing R2 data for {monthly_key} ...")
-        try:
-            existing_df = download_existing_monthly(client, args.bucket, monthly_key)
-        except Exception as e:
-            print(f"  WARN: could not fetch existing data for {sid}, proceeding with new rows only: {e}")
-            existing_df = None
-
-        if existing_df is not None:
-            print(f"    Existing rows in R2: {len(existing_df)}")
+        if args.no_merge:
+            merged_df = new_df
         else:
-            print(f"    No existing data in R2 (first upload for this month)")
+            # Download whatever is already in R2 for this sensor/month
+            print(f"    Fetching existing R2 data for {monthly_key} ...")
+            try:
+                existing_df = download_existing_monthly(client, args.bucket, monthly_key)
+            except Exception as e:
+                print(f"  WARN: could not fetch existing data for {sid}, proceeding with new rows only: {e}")
+                existing_df = None
 
-        # Merge existing + new, preferring new values on duplicate timestamps
-        merged_df = merge_with_existing(new_df, existing_df)
-        print(f"    Merged total rows: {len(merged_df)}")
+            if existing_df is not None:
+                print(f"    Existing rows in R2: {len(existing_df)}")
+            else:
+                print(f"    No existing data in R2 (first upload for this month)")
+
+            # Merge existing + new, preferring new values on duplicate timestamps
+            merged_df = merge_with_existing(new_df, existing_df)
+            print(f"    Merged total rows: {len(merged_df)}")
 
         monthly_path = build_monthly_file(merged_df, publish_dir, sid, month)
         if monthly_path:

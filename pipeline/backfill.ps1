@@ -27,7 +27,7 @@ $RawDir         = $RawDirW      -replace '\\','/'
 $DownDir        = $DownDirW     -replace '\\','/'
 $CalDir         = $CalDirW      -replace '\\','/'
 
-$BACKFILL_END   = [datetime]"2026-05-20"
+$BACKFILL_END   = [datetime]"2026-05-28"
 $EtZone         = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
 
 # ---------------------------------------------------------------------------
@@ -51,6 +51,7 @@ $DEPLOY_QAQ = @{
     "MOD-00613"="2025-09-19"; "MOD-00623"="2025-09-19"
     "MOD-00622"="2025-10-30"; "MOD-00628"="2025-10-09"
     "MOD-00621"="2025-10-30"; "MOD-00627"="2025-10-30"
+    "MOD-00624"="2026-05-26"
 }
 
 $ALL_RAMP = @(
@@ -62,7 +63,7 @@ $ALL_RAMP = @(
 $ALL_QAQ = @(
     "MOD-00632","MOD-00616","MOD-00625","MOD-00631","MOD-00623",
     "MOD-00628","MOD-00627","MOD-00629","MOD-00614","MOD-00617",
-    "MOD-00618","MOD-00613","MOD-00622","MOD-00621"
+    "MOD-00618","MOD-00613","MOD-00622","MOD-00621","MOD-00624"
 )
 
 $LogFile = "$LogDir\backfill_$(Get-Date -f 'yyyy-MM-dd').log"
