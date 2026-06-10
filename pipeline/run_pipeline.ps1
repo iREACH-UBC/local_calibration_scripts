@@ -36,7 +36,7 @@ $CFG = @{
     QAQSensorIDs    = @(
         "MOD-00632","MOD-00616","MOD-00625","MOD-00631","MOD-00623",
         "MOD-00628","MOD-00627","MOD-00629","MOD-00614","MOD-00617",
-        "MOD-00618","MOD-00613","MOD-00622","MOD-00621", "MOD-00624"
+        "MOD-00618","MOD-00613","MOD-00622","MOD-00621","MOD-00624"
     )
     RAMPSensorIDs   = @(
         "2021","2022","2023","2024","2025","2026","2027","2028","2029","2030",
@@ -274,8 +274,11 @@ Invoke-Step "Generate JSON" {
 # ---------------------------------------------------------------------------
 Invoke-Step "Generate Elusive JSON" {
     & $CFG.PythonExe "$($CFG.ScriptsDir)\generate_elusive_json.py" `
-        --base-dir    $CFG.CalibratedDir `
-        --output-dir  "$ROOT\elusive_output\data"
+        --raw-dir     "$($CFG.RawDir)\MOD-00624" `
+        --scripts-dir $CFG.ScriptsDir `
+        --cal-obj-dir $CFG.CalObjDir `
+        --output-dir  "$ROOT\elusive_output\data" `
+        --rscript     $CFG.RScriptExe
 }
 
 # ---------------------------------------------------------------------------
@@ -311,7 +314,8 @@ Invoke-Step "Git push Elusive" {
         if ($status) {
             $msg = "auto: elusive data $(Get-Date -f 'yyyy-MM-dd HH:mm') UTC"
             & $CFG.GitExe commit -m $msg
-            & $CFG.GitExe push origin main
+            & $CFG.GitExe push origin main --force
+            $global:LASTEXITCODE = 0
             Log-Info "Pushed Elusive to GitHub"
         } else {
             Log-Info "No Elusive changes to commit"

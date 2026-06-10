@@ -27,7 +27,7 @@ $RawDir         = $RawDirW      -replace '\\','/'
 $DownDir        = $DownDirW     -replace '\\','/'
 $CalDir         = $CalDirW      -replace '\\','/'
 
-$BACKFILL_END   = [datetime]"2026-05-28"
+$BACKFILL_END   = [datetime]"2026-06-01"
 $EtZone         = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
 
 # ---------------------------------------------------------------------------

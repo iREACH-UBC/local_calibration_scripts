@@ -53,7 +53,6 @@ parse_ramp_timestamp_utc <- function(x) {
 read_one_ramp <- function(path) {
   df <- suppressMessages(readr::read_csv(path, show_col_types = FALSE))
   
-  # Required columns to match QAQ output schema
   need <- c("DATE", "CO", "NO", "NO2", "O3", "CO2", "T", "RH", "PM2.5")
   miss <- setdiff(need, names(df))
   if (length(miss) > 0) {
@@ -61,9 +60,11 @@ read_one_ramp <- function(path) {
     return(NULL)
   }
   
+  has_wind <- all(c("WD", "WS") %in% names(df))
+  
   out <- df %>%
     transmute(
-      date    = parse_ramp_timestamp_utc(.data$DATE),  # POSIXct in UTC
+      date    = parse_ramp_timestamp_utc(.data$DATE),
       CO      = as.numeric(.data$CO),
       NO      = as.numeric(.data$NO),
       NO2     = as.numeric(.data$NO2),
@@ -71,7 +72,9 @@ read_one_ramp <- function(path) {
       CO2     = as.numeric(.data$CO2),
       T       = as.numeric(.data$T),
       RH      = as.numeric(.data$RH),
-      `PM2.5` = as.numeric(.data$`PM2.5`)
+      `PM2.5` = as.numeric(.data$`PM2.5`),
+      WD      = if (has_wind) as.numeric(.data$WD) else NA_real_,
+      WS      = if (has_wind) as.numeric(.data$WS) else NA_real_
     ) %>%
     filter(!is.na(date))
   
@@ -163,10 +166,17 @@ process_ramp_sensor_join_downsample <- function(id,
     return(invisible(NULL))
   }
   
-  # Output columns (UTC) — matches QAQ script
+  # Output columns (UTC) — matches QAQ script (except if includes WS/WD)
   ds_out <- ds %>%
     mutate(DATE = format(with_tz(date, "UTC"), "%m/%d/%Y %H:%M")) %>%
-    select(DATE, CO, NO, NO2, O3, CO2, T, RH, `PM2.5`)
+    { 
+      base <- select(., DATE, CO, NO, NO2, O3, CO2, T, RH, `PM2.5`)
+      if (all(c("WD", "WS") %in% names(.)) &&
+          !all(is.na(.[["WD"]])) && !all(is.na(.[["WS"]]))) {
+        base <- bind_cols(base, select(., WD, WS))
+      }
+      base
+    }
   
   out_dir <- file.path(out_root, id)
   dir_create(out_dir)

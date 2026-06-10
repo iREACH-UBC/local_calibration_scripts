@@ -196,6 +196,8 @@ default_models_root <- file.path("..", "calibration_models")  # folder containin
     return(NULL)
   }
   
+  has_wind <- all(c("WD", "WS") %in% names(df))
+  
   out <- df %>%
     transmute(
       date    = mdy_hm(.data$DATE, tz = tz_in, quiet = TRUE),
@@ -206,7 +208,9 @@ default_models_root <- file.path("..", "calibration_models")  # folder containin
       CO2     = suppressWarnings(parse_number(as.character(.data$CO2))),
       T       = suppressWarnings(parse_number(as.character(.data$T))),
       RH      = suppressWarnings(parse_number(as.character(.data$RH))),
-      `PM2.5` = suppressWarnings(parse_number(as.character(.data$`PM2.5`)))
+      `PM2.5` = suppressWarnings(parse_number(as.character(.data$`PM2.5`))),
+      WD      = if (has_wind) suppressWarnings(parse_number(as.character(.data$WD))) else NA_real_,
+      WS      = if (has_wind) suppressWarnings(parse_number(as.character(.data$WS))) else NA_real_
     ) %>%
     filter(!is.na(date)) %>%
     arrange(date) %>%
@@ -394,8 +398,18 @@ ramp_apply_calibration <- function(sensor_ids,
       )
       
       pred_out <- pred %>%
+        left_join(
+          df %>% select(date, T, RH, WD, WS),
+          by = "date"
+        ) %>%
         mutate(DATE = format(with_tz(date, tz_out), "%m/%d/%Y %H:%M")) %>%
-        select(DATE, CO, NO, NO2, O3, CO2, PM2_5)
+        { 
+          base <- select(., DATE, CO, NO, NO2, O3, CO2, PM2_5, T, RH)
+          wind_cols <- intersect(c("WD", "WS"), names(.))
+          wind_present <- length(wind_cols) == 2 &&
+            !all(is.na(.[["WD"]])) && !all(is.na(.[["WS"]]))
+          if (wind_present) bind_cols(base, select(., all_of(wind_cols))) else base
+        }
       
       if (isTRUE(drop_negative_values)) {
         pred_out <- .drop_negative_rows(

@@ -242,8 +242,9 @@ qaq_apply_general_calibration <- function(sensor_ids,
       pred <- .apply_qaq_gas_calibration(df, calibration_models)
       
       pred_out <- pred %>%
+        left_join(df %>% select(date, T, RH), by = "date") %>%
         mutate(DATE = format(with_tz(date, tz_out), "%m/%d/%Y %H:%M")) %>%
-        select(DATE, CO, NO, NO2, O3, CO2, PM2_5)
+        select(DATE, CO, NO, NO2, O3, CO2, PM2_5, T, RH)
       
       # Drop any rows where any pollutant is negative
       pred_out <- .drop_negative_rows(pred_out, cols = c("CO", "NO", "NO2", "O3", "CO2", "PM2_5"), verbose = verbose)
