@@ -291,6 +291,81 @@ def fetch_notehub_coords(token: str) -> list[dict]:
     return coords
 
 
+def fetch_notehub_coords_all(token: str, start_unix: float = None, pages: int = 30) -> list[dict]:
+    """Fetch Notehub coords for backfill using time-bounded pages with retry on 429."""
+    import time
+    all_coords = []
+    cursor = None
+
+    # Build base URL — filter by startDate if provided to skip irrelevant old events
+    base = (
+        f"{NOTEHUB_BASE}/projects/{NOTEHUB_PROJECT}/events"
+        f"?files=data.qo&sortBy=captured&sortOrder=asc&pageSize={NOTEHUB_PAGESIZE}"
+    )
+    if start_unix is not None:
+        # Notehub startDate expects Unix seconds as integer
+        base += f"&startDate={int(start_unix)}"
+
+    for page_num in range(pages):
+        url = base if cursor is None else base + f"&cursor={cursor}"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        attempt = 0
+        data = None
+        while attempt < 5:
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = json.loads(resp.read())
+                break
+            except Exception as e:
+                if "429" in str(e):
+                    wait = 5 * (attempt + 1)
+                    print(f"[WARN] Notehub 429 on page {page_num+1}, retrying in {wait}s...", file=sys.stderr)
+                    time.sleep(wait)
+                    attempt += 1
+                else:
+                    print(f"[WARN] Notehub page fetch failed: {e}", file=sys.stderr)
+                    break
+        if data is None:
+            break
+
+        events = data.get("events", [])
+        if not events:
+            break
+        for ev in events:
+            when = ev.get("when")
+            if when is None:
+                continue
+            body = ev.get("body", {}) or {}
+            lat = body.get("Latitude")
+            lon = body.get("Longitude")
+            valid_body = (
+                lat is not None and lon is not None
+                and lat != 0 and lon != 0
+                and -90 <= lat <= 90 and -180 <= lon <= 180
+            )
+            if valid_body:
+                all_coords.append({"unix": float(when), "lat": lat, "lon": lon, "source": "body"})
+            else:
+                best_lat = ev.get("best_lat")
+                best_lon = ev.get("best_lon")
+                valid_best = (
+                    best_lat is not None and best_lon is not None
+                    and best_lat != 0 and best_lon != 0
+                    and -90 <= best_lat <= 90 and -180 <= best_lon <= 180
+                )
+                if valid_best:
+                    all_coords.append({"unix": float(when), "lat": best_lat, "lon": best_lon, "source": "notehub_best"})
+        cursor = data.get("through")
+        has_more = data.get("has_more", False)
+        print(f"[INFO] Page {page_num+1}: {len(events)} events, total coords so far: {len(all_coords)}", file=sys.stderr)
+        if not has_more or not cursor:
+            break
+        time.sleep(1)  # gentle pacing between pages
+
+    print(f"[INFO] Fetched {len(all_coords)} Notehub coordinate records (backfill)", file=sys.stderr)
+    return all_coords
+
+
 def match_coords(unix_ts: float, notehub_coords: list[dict]) -> tuple[float, float]:
     """Return (lat, lon) of nearest Notehub event by Unix timestamp."""
     if not notehub_coords:
@@ -366,14 +441,74 @@ if __name__ == "__main__":
     parser.add_argument("--scripts-dir", required=True)
     parser.add_argument("--cal-obj-dir", required=True)
     parser.add_argument("--output-dir",  required=True)
-    parser.add_argument("--rscript",     default="C:\\Program Files\\R\\R-4.5.3\\bin\\Rscript.exe")
+    parser.add_argument("--rscript",          default="C:\\Program Files\\R\\R-4.5.3\\bin\\Rscript.exe")
+    parser.add_argument("--backfill-coords",  action="store_true",
+                        help="Re-fetch all Notehub coords and update history.geojson coordinates without reprocessing raw data")
     args = parser.parse_args()
 
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    geojson_path = output_dir / "history.geojson"
+    latest_path  = output_dir / "latest.json"
+
+    token = os.environ.get("NOTEHUB_TOKEN", "")
+
+    # ------------------------------------------------------------------
+    # Backfill-coords mode: update coords in existing history without
+    # reprocessing raw data.
+    # ------------------------------------------------------------------
+    if args.backfill_coords:
+        if not token:
+            sys.exit("[FATAL] --backfill-coords requires NOTEHUB_TOKEN to be set")
+        if not geojson_path.exists():
+            sys.exit("[FATAL] No history.geojson found to backfill")
+
+        print("[INFO] Backfill-coords mode: fetching full Notehub history...", file=sys.stderr)
+        # Start from the earliest timestamp in history minus a small buffer
+        existing_check = json.loads(geojson_path.read_text(encoding="utf-8"))
+        first_ts = existing_check.get("features", [{}])[0].get("properties", {}).get("timestamp")
+        start_unix = None
+        if first_ts:
+            try:
+                import pandas as _pd
+                start_unix = _pd.Timestamp(first_ts).timestamp() - 3600
+            except Exception:
+                pass
+        all_coords = fetch_notehub_coords_all(token, start_unix=start_unix, pages=30)
+        if not all_coords:
+            sys.exit("[FATAL] No Notehub coordinates fetched")
+
+        existing = json.loads(geojson_path.read_text(encoding="utf-8"))
+        features = existing.get("features", [])
+        print(f"[INFO] Updating coordinates for {len(features)} features...", file=sys.stderr)
+
+        default_coords = {DEFAULT_LAT, (DEFAULT_LAT, DEFAULT_LON)}
+        updated = 0
+        for f in features:
+            ts = f.get("properties", {}).get("timestamp")
+            if not ts:
+                continue
+            try:
+                unix_ts = pd.Timestamp(ts).timestamp()
+            except Exception:
+                continue
+            lat, lon = match_coords(unix_ts, all_coords)
+            # Only update if coords changed
+            old_coords = f["geometry"]["coordinates"]
+            if old_coords != [lon, lat]:
+                f["geometry"]["coordinates"] = [lon, lat]
+                updated += 1
+
+        geojson_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+        print(f"[SUCCESS] Backfill complete — updated {updated}/{len(features)} feature coordinates", file=sys.stderr)
+        sys.exit(0)
+
+    # ------------------------------------------------------------------
+    # Normal pipeline mode
+    # ------------------------------------------------------------------
     raw_dir     = Path(args.raw_dir)
     scripts_dir = Path(args.scripts_dir)
     cal_obj_dir = Path(args.cal_obj_dir)
-    output_dir  = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load and resample
     df_raw = load_and_resample_raw(raw_dir)
@@ -393,22 +528,57 @@ if __name__ == "__main__":
     df_cal = add_aqhi(df_cal)
 
     # Notehub coordinates
-    token = os.environ.get("NOTEHUB_TOKEN", "")
     if token:
         notehub_coords = fetch_notehub_coords(token)
     else:
         print("[WARN] NOTEHUB_TOKEN not set — using default coordinates", file=sys.stderr)
         notehub_coords = []
 
-    # Build outputs
-    geojson = build_geojson(df_cal, notehub_coords)
-    latest  = build_latest(df_cal, notehub_coords)
+    # Build new features from current calibrated data
+    new_geojson = build_geojson(df_cal, notehub_coords)
+    latest      = build_latest(df_cal, notehub_coords)
 
-    geojson_path = output_dir / "history.geojson"
-    latest_path  = output_dir / "latest.json"
+    # Load existing history.geojson and merge, deduplicating by timestamp.
+    # Preserve existing coordinates — only overwrite pollutant values for
+    # timestamps that already exist in history.
+    if geojson_path.exists():
+        try:
+            existing = json.loads(geojson_path.read_text(encoding="utf-8"))
+            existing_features = existing.get("features", [])
+            print(f"[INFO] Loaded {len(existing_features)} existing features", file=sys.stderr)
+        except Exception as e:
+            print(f"[WARN] Could not load existing history.geojson: {e}", file=sys.stderr)
+            existing_features = []
+    else:
+        existing_features = []
 
-    geojson_path.write_text(json.dumps(geojson, indent=2) + "\n", encoding="utf-8")
+    # Index existing features by timestamp
+    feature_map = {}
+    for f in existing_features:
+        ts = f.get("properties", {}).get("timestamp")
+        if ts:
+            feature_map[ts] = f
+
+    # Merge new features: preserve existing coords, only update pollutants
+    for f in new_geojson["features"]:
+        ts = f.get("properties", {}).get("timestamp")
+        if not ts:
+            continue
+        if ts in feature_map:
+            # Timestamp already in history — update pollutants but keep coords
+            existing_coords = feature_map[ts]["geometry"]["coordinates"]
+            feature_map[ts] = f
+            feature_map[ts]["geometry"]["coordinates"] = existing_coords
+        else:
+            # New timestamp — add with fresh coords from Notehub
+            feature_map[ts] = f
+
+    merged_features = sorted(feature_map.values(),
+                             key=lambda f: f["properties"]["timestamp"])
+    merged_geojson = {"type": "FeatureCollection", "features": merged_features}
+
+    geojson_path.write_text(json.dumps(merged_geojson, indent=2) + "\n", encoding="utf-8")
     latest_path.write_text(json.dumps(latest, indent=2) + "\n", encoding="utf-8")
 
-    print(f"[SUCCESS] history.geojson written ({len(df_cal)} features)", file=sys.stderr)
+    print(f"[SUCCESS] history.geojson written ({len(merged_features)} total features)", file=sys.stderr)
     print(f"[SUCCESS] latest.json written (latest: {latest['timestamp']})", file=sys.stderr)

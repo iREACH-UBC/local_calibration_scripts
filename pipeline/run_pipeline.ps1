@@ -273,12 +273,7 @@ Invoke-Step "Generate JSON" {
 # 6. GENERATE ELUSIVE JSON
 # ---------------------------------------------------------------------------
 Invoke-Step "Generate Elusive JSON" {
-    & $CFG.PythonExe "$($CFG.ScriptsDir)\generate_elusive_json.py" `
-        --raw-dir     "$($CFG.RawDir)\MOD-00624" `
-        --scripts-dir $CFG.ScriptsDir `
-        --cal-obj-dir $CFG.CalObjDir `
-        --output-dir  "$ROOT\elusive_output\data" `
-        --rscript     $CFG.RScriptExe
+    & $CFG.PythonExe "$($CFG.ScriptsDir)\generate_elusive_json.py" --raw-dir "$($CFG.RawDir)\MOD-00624" --scripts-dir $CFG.ScriptsDir --cal-obj-dir $CFG.CalObjDir --output-dir "$ROOT\elusive_output\data" --rscript $CFG.RScriptExe
 }
 
 # ---------------------------------------------------------------------------
@@ -309,12 +304,13 @@ Invoke-Step "Git push Elusive" {
     $ElusiveRepoDir = "$ROOT\elusive_output"
     Push-Location $ElusiveRepoDir
     try {
+        & $CFG.GitExe pull origin main --rebase
         & $CFG.GitExe add "data/history.geojson" "data/latest.json"
         $status = & $CFG.GitExe status --porcelain
         if ($status) {
             $msg = "auto: elusive data $(Get-Date -f 'yyyy-MM-dd HH:mm') UTC"
             & $CFG.GitExe commit -m $msg
-            & $CFG.GitExe push origin main --force
+            & $CFG.GitExe push origin main
             $global:LASTEXITCODE = 0
             Log-Info "Pushed Elusive to GitHub"
         } else {
