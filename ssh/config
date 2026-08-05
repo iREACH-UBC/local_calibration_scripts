@@ -1,0 +1,15 @@
+Host github-dashboard-local
+    HostName github.com
+    User git
+    IdentityFile C:/ProgramData/iREACH/ssh/dashboard_local_deploy
+    IdentitiesOnly yes
+    BatchMode yes
+    StrictHostKeyChecking accept-new
+
+Host github-elusive
+    HostName github.com
+    User git
+    IdentityFile C:/ProgramData/iREACH/ssh/elusive_deploy
+    IdentitiesOnly yes
+    BatchMode yes
+    StrictHostKeyChecking accept-new

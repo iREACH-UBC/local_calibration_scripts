@@ -325,43 +325,70 @@ def main():
         monthly_key = f"monthly/{sid}/{sid}_{year}_{mon}.csv"
 
         if args.no_merge:
-            merged_df = new_df
+            # The frequent pipeline only uploads recent daily files.
+            # It must never overwrite the complete monthly file with the
+            # locally available 48-hour window.
+            print("    Skipping monthly upload (--no-merge)")
         else:
-            # Download whatever is already in R2 for this sensor/month
             print(f"    Fetching existing R2 data for {monthly_key} ...")
+
             try:
-                existing_df = download_existing_monthly(client, args.bucket, monthly_key)
+                existing_df = download_existing_monthly(
+                    client,
+                    args.bucket,
+                    monthly_key,
+                )
             except Exception as e:
-                print(f"  WARN: could not fetch existing data for {sid}, proceeding with new rows only: {e}")
-                existing_df = None
+                print(
+                    f"  FAIL: could not fetch existing monthly data for "
+                    f"{sid}; refusing to overwrite it: {e}"
+                )
+                failed += 1
+                continue
 
             if existing_df is not None:
                 print(f"    Existing rows in R2: {len(existing_df)}")
             else:
-                print(f"    No existing data in R2 (first upload for this month)")
+                print("    No existing data in R2 (first upload for this month)")
 
-            # Merge existing + new, preferring new values on duplicate timestamps
             merged_df = merge_with_existing(new_df, existing_df)
             print(f"    Merged total rows: {len(merged_df)}")
 
-        monthly_path = build_monthly_file(merged_df, publish_dir, sid, month)
-        if monthly_path:
-            if upload_file(client, monthly_path, args.bucket, monthly_key):
-                uploaded += 1
-            else:
-                failed += 1
+            monthly_path = build_monthly_file(
+                merged_df,
+                publish_dir,
+                sid,
+                month,
+            )
+
+            if monthly_path:
+                if upload_file(
+                    client,
+                    monthly_path,
+                    args.bucket,
+                    monthly_key,
+                ):
+                    uploaded += 1
+                else:
+                    failed += 1
 
         # ── Daily files ───────────────────────────────────────────────────────
-        # Daily files cover a single day; overwriting is safe here because
-        # the pipeline only re-processes the last 48 hours.
-        daily_paths = build_daily_files(merged_df, publish_dir, sid, month)
+        # Daily files are constructed only from the newly calibrated rows.
+        # Existing historical daily objects remain untouched in R2.
+        daily_paths = build_daily_files(
+            new_df,
+            publish_dir,
+            sid,
+            month,
+        )
+
         for daily_path in daily_paths:
             key = f"daily/{sid}/{month}/{daily_path.name}"
+
             if upload_file(client, daily_path, args.bucket, key):
                 uploaded += 1
             else:
                 failed += 1
-
     print(f"\n[upload_to_r2] Done -- {uploaded} uploaded, {failed} failed.")
     if failed:
         sys.exit(1)

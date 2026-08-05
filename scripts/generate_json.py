@@ -23,7 +23,7 @@ SENSORS_WANTED: set[str] | None = {
     "2021",      # West Vancouver Memorial Library
     "2040",      # Gillies Bay Library (Texada)
     "2022",      # Powell River Public Library (qathet outdoor)
-    "2024",      # Chief Joe Mathias Centre
+    "MOD-00620",      # Chief Joe Mathias Centre
     "2033",      # Squamish Nation Totem Hall (replaced 2032 on 2026-03-26)
     "2042",      # Pemberton Community Centre
     "2043",      # Whistler Public Library

@@ -1,7 +1,5 @@
-# =============================================================================
-# iREACH LCS Pipeline - run_pipeline.ps1
+﻿# iREACH LCS Pipeline
 # Runs every 15 minutes via Task Scheduler (SYSTEM account).
-# =============================================================================
 
 param(
     [switch]$Force
@@ -9,9 +7,10 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$global:LASTEXITCODE = 0
 
 # ---------------------------------------------------------------------------
-# CONFIGURATION
+# Configuration
 # ---------------------------------------------------------------------------
 $ROOT = "C:\ProgramData\iREACH"
 
@@ -28,6 +27,8 @@ $CFG = @{
     RScriptExe      = "C:\Program Files\R\R-4.5.3\bin\Rscript.exe"
     PythonExe       = "C:\ProgramData\Python\bin\python.exe"
     GitExe          = "C:\Program Files\Git\cmd\git.exe"
+    GitSshConfig    = "$ROOT\ssh\config"
+    GitSshCommand   = "ssh -F C:/ProgramData/iREACH/ssh/config"
     R2Bucket        = "lcs-calibrated-data"
     R2Endpoint      = "https://bfde061b9c815bbce1c08766ebac283d.r2.cloudflarestorage.com"
     R2Prefix        = "calibrated"
@@ -36,7 +37,7 @@ $CFG = @{
     QAQSensorIDs    = @(
         "MOD-00632","MOD-00616","MOD-00625","MOD-00631","MOD-00623",
         "MOD-00628","MOD-00627","MOD-00629","MOD-00614","MOD-00617",
-        "MOD-00618","MOD-00613","MOD-00622","MOD-00621","MOD-00624"
+        "MOD-00618","MOD-00613","MOD-00622","MOD-00621","MOD-00624", "MOD-00620"
     )
     RAMPSensorIDs   = @(
         "2021","2022","2023","2024","2025","2026","2027","2028","2029","2030",
@@ -46,7 +47,7 @@ $CFG = @{
 }
 
 # ---------------------------------------------------------------------------
-# LOCK FILE
+# Lock file - prevents overlapping runs, stale locks cleared after 30 min
 # ---------------------------------------------------------------------------
 $LockFile = "$($CFG.PipelineDir)\pipeline.lock"
 
@@ -63,7 +64,7 @@ if (-not $Force) {
 }
 
 # ---------------------------------------------------------------------------
-# LOGGING
+# Logging
 # ---------------------------------------------------------------------------
 $LogFile = "$($CFG.LogDir)\pipeline_$(Get-Date -f 'yyyy-MM-dd').log"
 
@@ -78,34 +79,95 @@ function Log-Warn  { param([string]$m) Write-Log "WARN " $m }
 function Log-Error { param([string]$m) Write-Log "ERROR" $m }
 
 # ---------------------------------------------------------------------------
-# ENSURE DIRECTORIES EXIST
+# Ensure output directories exist
 # ---------------------------------------------------------------------------
 @(
     $CFG.RawDir, $CFG.DownsampledDir, $CFG.CalibratedDir,
     $CFG.PublishDir, $CFG.OutputDir, $CFG.LogDir
 ) | ForEach-Object {
-    if (-not (Test-Path $_)) { New-Item -ItemType Directory -Path $_ -Force | Out-Null }
+    if (-not (Test-Path $_)) {
+        New-Item -ItemType Directory -Path $_ -Force | Out-Null
+    }
 }
 
 # ---------------------------------------------------------------------------
-# STEP RUNNER
+# Step runner - logs start/ok/fail, removes lock and rethrows on failure
 # ---------------------------------------------------------------------------
 function Invoke-Step {
     param([string]$Label, [scriptblock]$Block)
+
     Log-Info "START $Label"
+    $global:LASTEXITCODE = 0
+
     try {
         & $Block
-        if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { throw "exit code $LASTEXITCODE" }
+
+        if ($global:LASTEXITCODE -ne 0) {
+            throw "exit code $global:LASTEXITCODE"
+        }
+
         Log-Info "OK $Label"
     } catch {
         Log-Error "FAILED $Label - $_"
-        if (Test-Path $LockFile) { Remove-Item $LockFile -Force }
+        if (Test-Path $LockFile) {
+            Remove-Item $LockFile -Force
+        }
         throw
     }
 }
 
 # ---------------------------------------------------------------------------
-# DATE WINDOW
+# Git helpers
+# ---------------------------------------------------------------------------
+function Set-GitNonInteractiveEnvironment {
+    $env:GIT_TERMINAL_PROMPT = "0"
+    $env:GCM_INTERACTIVE = "never"
+    $env:GCM_GUI_PROMPT = "0"
+    $env:GIT_SSH_COMMAND = $CFG.GitSshCommand
+}
+
+function Invoke-Git {
+    param(
+        [string]$Repo,
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [string[]]$GitArgs
+    )
+
+    & $CFG.GitExe -C $Repo @GitArgs
+
+    if ($global:LASTEXITCODE -ne 0) {
+        throw "git -C `"$Repo`" $($GitArgs -join ' ') failed with exit code $global:LASTEXITCODE"
+    }
+}
+
+function Get-GitStatusPorcelain {
+    param([string]$Repo)
+
+    $status = & $CFG.GitExe -C $Repo status --porcelain
+
+    if ($global:LASTEXITCODE -ne 0) {
+        throw "git -C `"$Repo`" status --porcelain failed with exit code $global:LASTEXITCODE"
+    }
+
+    return $status
+}
+
+function Initialize-GitRepoForPipeline {
+    param([string]$Repo)
+
+    Set-GitNonInteractiveEnvironment
+
+    if (-not (Test-Path $CFG.GitSshConfig)) {
+        throw "Git SSH config missing: $($CFG.GitSshConfig)"
+    }
+
+    # Repo-local setting is intentional. It avoids relying only on inherited
+    # environment variables when running under Task Scheduler as SYSTEM.
+    Invoke-Git $Repo config core.sshCommand $CFG.GitSshCommand
+}
+
+# ---------------------------------------------------------------------------
+# Date window: 48h UTC lookback; ET window for RAMP
 # ---------------------------------------------------------------------------
 $UtcNow    = [System.DateTime]::UtcNow
 $EndDate   = $UtcNow.Date
@@ -114,7 +176,10 @@ $StartUTC  = $StartDate.ToString("yyyy-MM-dd")
 $EndUTC    = $EndDate.ToString("yyyy-MM-dd")
 $EtZone    = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
 $NowET     = [System.TimeZoneInfo]::ConvertTimeFromUtc($UtcNow, $EtZone)
-$StartET   = $StartDate.ToString("yyyy-MM-dd")
+# RAMP endpoint files roll over on Eastern time rather than UTC.
+# The first 4 hours of UTC day X during EDT are stored in endpoint file X-1.
+# Request one extra endpoint day so the full UTC window is available.
+$StartET   = $StartDate.AddDays(-1).ToString("yyyy-MM-dd")
 $EndET     = $NowET.Date.ToString("yyyy-MM-dd")
 $Month     = Get-Date -Format "yyyy-MM"
 
@@ -124,7 +189,7 @@ Log-Info "ET window: $StartET to $EndET"
 Log-Info "Month: $Month"
 
 # ---------------------------------------------------------------------------
-# 1. CLEAN RAW DATA (wipe and redownload fresh 48h window each run)
+# 1. Clear raw data and re-download fresh 48h window
 # ---------------------------------------------------------------------------
 Log-Info "Clearing raw data for fresh 48h download..."
 @($CFG.QAQSensorIDs + $CFG.RAMPSensorIDs) | ForEach-Object {
@@ -134,9 +199,6 @@ Log-Info "Clearing raw data for fresh 48h download..."
     }
 }
 
-# ---------------------------------------------------------------------------
-# 2. DOWNLOAD
-# ---------------------------------------------------------------------------
 Invoke-Step "Download QAQ" {
     & $CFG.PythonExe "$($CFG.ScriptsDir)\QAQ_download.py" `
         --sensors  $CFG.QAQSensorIDs `
@@ -155,7 +217,7 @@ Invoke-Step "Download RAMP" {
 }
 
 # ---------------------------------------------------------------------------
-# 2. JOIN AND DOWNSAMPLE
+# 2. Join and downsample to 15-min bins
 # ---------------------------------------------------------------------------
 Log-Info "Clearing downsampled data for fresh join..."
 @($CFG.QAQSensorIDs + $CFG.RAMPSensorIDs) | ForEach-Object {
@@ -164,14 +226,14 @@ Log-Info "Clearing downsampled data for fresh join..."
         Remove-Item "$sensorDs\*.csv" -Force -ErrorAction SilentlyContinue
     }
 }
-$qaqIds  = "'" + ($CFG.QAQSensorIDs  -join "','") + "'"
-$rampIds = "'" + ($CFG.RAMPSensorIDs -join "','") + "'"
 
-$ScriptsDir    = $CFG.ScriptsDir    -replace '\\','/'
-$RawDir        = $CFG.RawDir        -replace '\\','/'
-$DownsampledDir= $CFG.DownsampledDir-replace '\\','/'
-$CalibratedDir = $CFG.CalibratedDir -replace '\\','/'
-$CalObjDir     = $CFG.CalObjDir     -replace '\\','/'
+$qaqIds         = "'" + ($CFG.QAQSensorIDs  -join "','") + "'"
+$rampIds        = "'" + ($CFG.RAMPSensorIDs -join "','") + "'"
+$ScriptsDir     = $CFG.ScriptsDir     -replace '\\','/'
+$RawDir         = $CFG.RawDir         -replace '\\','/'
+$DownsampledDir = $CFG.DownsampledDir -replace '\\','/'
+$CalibratedDir  = $CFG.CalibratedDir  -replace '\\','/'
+$CalObjDir      = $CFG.CalObjDir      -replace '\\','/'
 
 $rJoin = @"
 options(pipeline.sourced = TRUE)
@@ -194,14 +256,14 @@ ramp_join_downsample_all(
 "@
 
 Invoke-Step "Join and downsample" {
-    $tmp = "C:\ProgramData\iREACH\pipeline\tmp_pipeline_join.R"
+    $tmp = "$($CFG.PipelineDir)\tmp_pipeline_join.R"
     Set-Content $tmp $rJoin -Encoding ASCII
     & $CFG.RScriptExe $tmp
     Remove-Item $tmp -ErrorAction SilentlyContinue
 }
 
 # ---------------------------------------------------------------------------
-# 3. CALIBRATE
+# 3. Apply calibration models
 # ---------------------------------------------------------------------------
 Log-Info "Clearing calibrated data for fresh calibration..."
 @($CFG.QAQSensorIDs + $CFG.RAMPSensorIDs) | ForEach-Object {
@@ -210,6 +272,7 @@ Log-Info "Clearing calibrated data for fresh calibration..."
         Remove-Item "$sensorCal\*.csv" -Force -ErrorAction SilentlyContinue
     }
 }
+
 $rCal = @"
 options(pipeline.sourced = TRUE)
 local({ source(file.path('$ScriptsDir', 'QAQ_apply_calibration.R')) })
@@ -240,14 +303,14 @@ ramp_apply_calibration(
 "@
 
 Invoke-Step "Calibrate" {
-    $tmp = "C:\ProgramData\iREACH\pipeline\tmp_pipeline_cal.R"
+    $tmp = "$($CFG.PipelineDir)\tmp_pipeline_cal.R"
     Set-Content $tmp $rCal -Encoding ASCII
     & $CFG.RScriptExe $tmp
     Remove-Item $tmp -ErrorAction SilentlyContinue
 }
 
 # ---------------------------------------------------------------------------
-# 4. BUILD MONTHLY COMBINED CSV AND UPLOAD TO R2
+# 4. Build monthly CSV and upload to Cloudflare R2
 # ---------------------------------------------------------------------------
 Invoke-Step "Upload to R2" {
     & $CFG.PythonExe "$($CFG.PipelineDir)\upload_to_r2.py" `
@@ -260,7 +323,7 @@ Invoke-Step "Upload to R2" {
 }
 
 # ---------------------------------------------------------------------------
-# 5. GENERATE JSON
+# 5. Generate main dashboard JSON
 # ---------------------------------------------------------------------------
 Invoke-Step "Generate JSON" {
     & $CFG.PythonExe "$($CFG.ScriptsDir)\generate_json.py" `
@@ -270,59 +333,76 @@ Invoke-Step "Generate JSON" {
 }
 
 # ---------------------------------------------------------------------------
-# 6. GENERATE ELUSIVE JSON
+# 6. Generate Elusive vessel dashboard JSON
+#    Non-fatal: vessel may be offline or out of cell range.
 # ---------------------------------------------------------------------------
-Invoke-Step "Generate Elusive JSON" {
-    & $CFG.PythonExe "$($CFG.ScriptsDir)\generate_elusive_json.py" --raw-dir "$($CFG.RawDir)\MOD-00624" --scripts-dir $CFG.ScriptsDir --cal-obj-dir $CFG.CalObjDir --output-dir "$ROOT\elusive_output\data" --rscript $CFG.RScriptExe
+Log-Info "START Generate Elusive JSON"
+try {
+    $global:LASTEXITCODE = 0
+
+    & $CFG.PythonExe "$($CFG.ScriptsDir)\generate_elusive_json.py" `
+        --raw-dir     "$($CFG.RawDir)\MOD-00624" `
+        --scripts-dir $CFG.ScriptsDir `
+        --cal-obj-dir $CFG.CalObjDir `
+        --output-dir  "$ROOT\elusive_output\data" `
+        --rscript     $CFG.RScriptExe
+
+    if ($global:LASTEXITCODE -ne 0) {
+        Log-Warn "Generate Elusive JSON failed (exit $global:LASTEXITCODE) - pipeline continues"
+        $global:LASTEXITCODE = 0
+    } else {
+        Log-Info "OK Generate Elusive JSON"
+    }
+} catch {
+    Log-Warn "Generate Elusive JSON error: $_ - pipeline continues"
+    $global:LASTEXITCODE = 0
 }
 
 # ---------------------------------------------------------------------------
-# 7. GIT PUSH (main dashboard)
+# 7. Push main dashboard to GitHub
 # ---------------------------------------------------------------------------
 Invoke-Step "Git push" {
-    Push-Location $CFG.RepoDir
-    try {
-        & $CFG.GitExe add "pollutant_data.json"
-        $status = & $CFG.GitExe status --porcelain
-        if ($status) {
-            $msg = "auto: pollutant_data.json $(Get-Date -f 'yyyy-MM-dd HH:mm') UTC"
-            & $CFG.GitExe commit -m $msg
-            & $CFG.GitExe push origin $CFG.GitBranch
-            Log-Info "Pushed to GitHub"
-        } else {
-            Log-Info "No changes to commit"
-        }
-    } finally {
-        Pop-Location
+    Initialize-GitRepoForPipeline $CFG.RepoDir
+
+    Invoke-Git $CFG.RepoDir add "pollutant_data.json"
+
+    $status = Get-GitStatusPorcelain $CFG.RepoDir
+    if ($status) {
+        $msg = "auto: pollutant_data.json $(Get-Date -f 'yyyy-MM-dd HH:mm') UTC"
+        Invoke-Git $CFG.RepoDir commit -m $msg
+        Invoke-Git $CFG.RepoDir push origin $CFG.GitBranch
+        Log-Info "Pushed to GitHub"
+    } else {
+        Log-Info "No changes to commit"
     }
 }
 
 # ---------------------------------------------------------------------------
-# 8. GIT PUSH (Elusive dashboard)
+# 8. Push Elusive dashboard to GitHub
 # ---------------------------------------------------------------------------
 Invoke-Step "Git push Elusive" {
     $ElusiveRepoDir = "$ROOT\elusive_output"
-    Push-Location $ElusiveRepoDir
-    try {
-        & $CFG.GitExe pull origin main --rebase
-        & $CFG.GitExe add "data/history.geojson" "data/latest.json"
-        $status = & $CFG.GitExe status --porcelain
-        if ($status) {
-            $msg = "auto: elusive data $(Get-Date -f 'yyyy-MM-dd HH:mm') UTC"
-            & $CFG.GitExe commit -m $msg
-            & $CFG.GitExe push origin main
-            $global:LASTEXITCODE = 0
-            Log-Info "Pushed Elusive to GitHub"
-        } else {
-            Log-Info "No Elusive changes to commit"
-        }
-    } finally {
-        Pop-Location
+
+    Initialize-GitRepoForPipeline $ElusiveRepoDir
+
+    Invoke-Git $ElusiveRepoDir pull --rebase --autostash origin main
+    Invoke-Git $ElusiveRepoDir add -f "data/history.geojson" "data/latest.json"
+
+    $status = Get-GitStatusPorcelain $ElusiveRepoDir
+    if ($status) {
+        $msg = "auto: elusive data $(Get-Date -f 'yyyy-MM-dd HH:mm') UTC"
+        Invoke-Git $ElusiveRepoDir commit -m $msg
+        Invoke-Git $ElusiveRepoDir push origin main
+        Log-Info "Pushed Elusive to GitHub"
+    } else {
+        Log-Info "No Elusive changes to commit"
     }
 }
 
 # ---------------------------------------------------------------------------
-# DONE
+# Done
 # ---------------------------------------------------------------------------
-if (Test-Path $LockFile) { Remove-Item $LockFile -Force }
+if (Test-Path $LockFile) {
+    Remove-Item $LockFile -Force
+}
 Log-Info "Pipeline complete"

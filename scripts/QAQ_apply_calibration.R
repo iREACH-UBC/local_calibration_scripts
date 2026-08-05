@@ -15,9 +15,17 @@
 # - Output DATE defaults to UTC (tz_out="UTC"). Override if you want local display.
 #
 # Model selection:
-# - If generalized_model = TRUE (default): use generalized calibration object for all sensors (currently set to 2032, change in line 51)
-# - Else: use each sensor's own calibration object (<sensor_id>/Calibration_Models.obj)
-# - You can still force a single explicit model_path for all sensors by passing model_path=...
+# - Gas models (CO/NO/NO2/CO2, and O3 unless overridden):
+#     If generalized_model = TRUE (default): use generalized calibration object for all sensors.
+#     Else: use each sensor's own calibration object (<sensor_id>/Calibration_Models.obj).
+#     You can still force a single explicit model_path for all sensors by passing model_path=...
+#
+# - O3-only model override:
+#     Sensors listed in ozone_use_generalized_sensor_ids use
+#     models_root/<ozone_generalized_id>/<model_filename> for O3 only.
+#     Default ozone_generalized_id is MOD-00111.
+#
+# - PM2.5 is not calibrated in this script; it is carried through as raw PM2.5.
 
 suppressPackageStartupMessages({
   library(dplyr)
@@ -35,6 +43,20 @@ default_in_root    <- file.path("..", "apply_calibrations", "apply_calibrations_
 default_out_root   <- file.path("..", "apply_calibrations", "apply_calibrations_calibrated_data")
 default_models_root <- file.path("..", "calibration_models")  # adjust as needed
 
+# QAQ sensors that should use the generalized O3 model only.
+# Shorthand list requested: 629, 614, 617, 618, 613, 615, 622, 621.
+default_ozone_generalized_sensor_ids <- c(
+  "MOD-00629", "MOD-00614", "MOD-00617", "MOD-00618",
+  "MOD-00613", "MOD-00615", "MOD-00622", "MOD-00621"
+)
+
+# ---- helper: accept file OR folder and return model file path ----------------
+.as_model_file <- function(path, model_filename = "Calibration_Models.obj") {
+  if (is.null(path) || !nzchar(path)) return(NULL)
+  if (dir.exists(path)) return(file.path(path, model_filename))
+  path
+}
+
 # ---- CAPS core loader --------------------------------------------------------
 .ensure_caps_loaded <- function(caps_core_path = "caps_core.R") {
   if (!exists("CAPS_Hybrid_Apply", mode = "function")) {
@@ -48,7 +70,7 @@ default_models_root <- file.path("..", "calibration_models")  # adjust as needed
 .resolve_model_path <- function(sensor_id,
                                 generalized_model,
                                 models_root,
-                                generalized_id = "2032",
+                                generalized_id = "MOD-",
                                 model_filename = "Calibration_Models.obj",
                                 model_path = NULL) {
   # Highest priority: explicit model_path (forces one model for all sensors)
@@ -60,6 +82,30 @@ default_models_root <- file.path("..", "calibration_models")  # adjust as needed
   
   use_id <- if (isTRUE(generalized_model)) generalized_id else sensor_id
   file.path(models_root, use_id, model_filename)
+}
+
+# ---- resolve model path (O3 only) -------------------------------------------
+.resolve_ozone_model_path <- function(sensor_id,
+                                      gas_model_path,
+                                      ozone_use_generalized_sensor_ids = default_ozone_generalized_sensor_ids,
+                                      models_root,
+                                      ozone_generalized_id = "MOD-00111",
+                                      model_filename = "Calibration_Models.obj",
+                                      ozone_model_path = NULL) {
+  # Highest priority: explicit O3 override path, file OR folder.
+  op <- .as_model_file(ozone_model_path, model_filename)
+  if (!is.null(op) && nzchar(op)) return(op)
+  
+  # Listed sensors use the generalized O3 object only.
+  if (sensor_id %in% as.character(ozone_use_generalized_sensor_ids)) {
+    if (is.null(models_root) || !nzchar(models_root)) {
+      stop("Generalized O3 override requires models_root=... or ozone_model_path=...")
+    }
+    return(file.path(models_root, ozone_generalized_id, model_filename))
+  }
+  
+  # All other sensors use the same model object as the other gases.
+  gas_model_path
 }
 
 # ---- load calibration_models safely + cache by path --------------------------
@@ -81,6 +127,27 @@ default_models_root <- file.path("..", "calibration_models")  # adjust as needed
     e$calibration_models
   }
 })
+
+# ---- model structure assertions ---------------------------------------------
+.assert_gas_models <- function(gas_models, model_path_for_msg = "<unknown>") {
+  need <- c("NO2", "NO", "CO2", "O3", "CO")
+  if (is.null(gas_models$gas$Hybrid)) {
+    stop("Gas model object does not contain gas$Hybrid as expected.\nModel path: ", model_path_for_msg)
+  }
+  miss <- setdiff(need, names(gas_models$gas$Hybrid))
+  if (length(miss) > 0) {
+    stop("Gas model missing Hybrid entries: ", paste(miss, collapse = ", "),
+         "\nModel path: ", model_path_for_msg)
+  }
+  invisible(TRUE)
+}
+
+.assert_ozone_model <- function(ozone_models, model_path_for_msg = "<unknown>") {
+  if (is.null(ozone_models$gas$Hybrid$O3)) {
+    stop("O3 model object does not contain gas$Hybrid$O3 as expected.\nModel path: ", model_path_for_msg)
+  }
+  invisible(TRUE)
+}
 
 # ---- read one already-downsampled QAQ file ----------------------------------
 .read_one_qaq_ds <- function(path, tz_in = "UTC") {
@@ -135,7 +202,12 @@ default_models_root <- file.path("..", "calibration_models")  # adjust as needed
 }
 
 # ---- apply QAQ gas calibration ----------------------------------------------
-.apply_qaq_gas_calibration <- function(df, calibration_models) {
+.apply_qaq_gas_calibration <- function(df, gas_models, ozone_models,
+                                       gas_model_path_for_msg = "<gas>",
+                                       ozone_model_path_for_msg = "<ozone>") {
+  .assert_gas_models(gas_models, gas_model_path_for_msg)
+  .assert_ozone_model(ozone_models, ozone_model_path_for_msg)
+  
   df_clean <- df %>% select(date, CO, NO, NO2, O3, CO2, T, RH, `PM2.5`)
   
   gas_mat <- df_clean %>%
@@ -145,11 +217,11 @@ default_models_root <- file.path("..", "calibration_models")  # adjust as needed
   
   pred_gas <- tibble(
     date = df_clean$date,
-    NO2  = as.numeric(CAPS_Hybrid_Apply(calibration_models$gas$Hybrid$NO2, gas_mat)),
-    NO   = as.numeric(CAPS_Hybrid_Apply(calibration_models$gas$Hybrid$NO,  gas_mat)),
-    CO2  = as.numeric(CAPS_Hybrid_Apply(calibration_models$gas$Hybrid$CO2, gas_mat)),
-    O3   = as.numeric(CAPS_Hybrid_Apply(calibration_models$gas$Hybrid$O3,  gas_mat)),
-    CO   = as.numeric(CAPS_Hybrid_Apply(calibration_models$gas$Hybrid$CO,  gas_mat))
+    NO2  = as.numeric(CAPS_Hybrid_Apply(gas_models$gas$Hybrid$NO2, gas_mat)),
+    NO   = as.numeric(CAPS_Hybrid_Apply(gas_models$gas$Hybrid$NO,  gas_mat)),
+    CO2  = as.numeric(CAPS_Hybrid_Apply(gas_models$gas$Hybrid$CO2, gas_mat)),
+    O3   = as.numeric(CAPS_Hybrid_Apply(ozone_models$gas$Hybrid$O3, gas_mat)),
+    CO   = as.numeric(CAPS_Hybrid_Apply(gas_models$gas$Hybrid$CO,  gas_mat))
   )
   
   # Keep PM2.5 as-is
@@ -168,6 +240,10 @@ qaq_apply_general_calibration <- function(sensor_ids,
                                           generalized_id    = "MOD-00617",
                                           model_filename    = "Calibration_Models.obj",
                                           model_path        = NULL,  # optional override for all sensors
+                                          # O3-only generalized override:
+                                          ozone_use_generalized_sensor_ids = default_ozone_generalized_sensor_ids,
+                                          ozone_generalized_id = "MOD-00111",
+                                          ozone_model_path     = NULL,  # O3 override: file OR folder for all sensors
                                           # other settings:
                                           caps_core_path    = "caps_core.R",
                                           in_root           = default_in_root,
@@ -214,10 +290,33 @@ qaq_apply_general_calibration <- function(sensor_ids,
       model_path        = model_path
     )
     
-    if (verbose) message("??? Using model: ", this_model_path)
+    if (verbose) message("??? Using gas model: ", this_model_path)
     
     # Cached load (loads once per unique path)
     calibration_models <- .load_calibration_models_cached(this_model_path)
+    
+    # Choose O3 model path. For listed QAQ sensors, O3 only comes from MOD-00111.
+    ozone_model_for_this_sensor <- .resolve_ozone_model_path(
+      sensor_id = id,
+      gas_model_path = this_model_path,
+      ozone_use_generalized_sensor_ids = ozone_use_generalized_sensor_ids,
+      models_root = models_root,
+      ozone_generalized_id = ozone_generalized_id,
+      model_filename = model_filename,
+      ozone_model_path = ozone_model_path
+    )
+    ozone_uses_generalized <- (
+      (!is.null(ozone_model_path) && nzchar(ozone_model_path)) ||
+        ((is.null(ozone_model_path) || !nzchar(ozone_model_path)) &&
+           id %in% as.character(ozone_use_generalized_sensor_ids))
+    )
+    if (verbose) {
+      msg_kind <- if (!is.null(ozone_model_path) && nzchar(ozone_model_path)) "forced"
+      else if (id %in% as.character(ozone_use_generalized_sensor_ids)) "generalized"
+      else "same-as-gas"
+      message("??? Using O3 model (", msg_kind, "): ", ozone_model_for_this_sensor)
+    }
+    ozone_models <- .load_calibration_models_cached(ozone_model_for_this_sensor)
     
     out_dir <- file.path(out_root, id)
     dir_create(out_dir)
@@ -239,7 +338,13 @@ qaq_apply_general_calibration <- function(sensor_ids,
       }
       
       if (verbose) message("??? Applying QAQ gas calibration ???")
-      pred <- .apply_qaq_gas_calibration(df, calibration_models)
+      pred <- .apply_qaq_gas_calibration(
+        df,
+        gas_models = calibration_models,
+        ozone_models = ozone_models,
+        gas_model_path_for_msg = this_model_path,
+        ozone_model_path_for_msg = ozone_model_for_this_sensor
+      )
       
       pred_out <- pred %>%
         left_join(df %>% select(date, T, RH), by = "date") %>%
@@ -263,7 +368,9 @@ qaq_apply_general_calibration <- function(sensor_ids,
         out_file          = out_file,
         rows              = nrow(pred_out),
         model_path        = this_model_path,
+        ozone_model_path  = ozone_model_for_this_sensor,
         generalized_model = generalized_model,
+        ozone_uses_generalized = ozone_uses_generalized,
         tz_in             = tz_in,
         tz_out            = tz_out
       )
@@ -304,12 +411,25 @@ qaq_apply_general_calibration <- function(sensor_ids,
   generalized_raw <- get_flag("--generalized", "TRUE")
   generalized_val <- tolower(generalized_raw) %in% c("true", "t", "1", "yes", "y")
   
+  parse_csv <- function(x) {
+    if (is.null(x) || !nzchar(x) || tolower(x) %in% c("none", "false", "no")) return(character(0))
+    strsplit(x, ",", fixed = TRUE)[[1]] |> str_trim() |> (\(z) z[nzchar(z)])()
+  }
+  
+  ozone_gen_sensors_raw <- get_flag(
+    "--ozone-generalized-sensors",
+    paste(default_ozone_generalized_sensor_ids, collapse = ",")
+  )
+  
   list(
     sensors        = strsplit(sensors_raw, ",", fixed = TRUE)[[1]] |> str_trim() |> (\(x) x[nzchar(x)])(),
     model          = get_flag("--model", NULL),
+    ozone_model    = get_flag("--ozone-model", NULL),
     models_root    = get_flag("--models-root", default_models_root),
     generalized    = generalized_val,
     generalized_id = get_flag("--generalized-id", "MOD-00617"),
+    ozone_generalized_sensors = parse_csv(ozone_gen_sensors_raw),
+    ozone_generalized_id = get_flag("--ozone-generalized-id", "MOD-00111"),
     model_filename = get_flag("--model-filename", "Calibration_Models.obj"),
     caps           = get_flag("--caps",  "caps_core.R"),
     in_root        = get_flag("--in-root",  default_in_root),
@@ -336,6 +456,9 @@ if (identical(environmentName(environment()), "R_GlobalEnv") && !interactive() &
     generalized_id    = a$generalized_id,
     model_filename    = a$model_filename,
     model_path        = a$model,
+    ozone_use_generalized_sensor_ids = a$ozone_generalized_sensors,
+    ozone_generalized_id = a$ozone_generalized_id,
+    ozone_model_path  = a$ozone_model,
     caps_core_path    = a$caps,
     in_root           = a$in_root,
     out_root          = a$out_root,

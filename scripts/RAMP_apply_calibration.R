@@ -16,11 +16,17 @@
 # - Output DATE formatted in tz_out (default tz_out="UTC").
 #
 # Model selection:
-# - Gas models (CO/NO/NO2/O3/CO2):
+# - Gas models (CO/NO/NO2/CO2):
 #     Priority:
 #       1) model_path (explicit; file OR folder) -> used for all sensors
 #       2) generalized_model=TRUE -> models_root/<generalized_id>/<model_filename>
 #       3) generalized_model=FALSE -> models_root/<sensor_id>/<model_filename>
+#
+# - O3 model:
+#     O3 is normally calibrated from the same gas model selection above.
+#     However, sensors listed in ozone_use_generalized_sensor_ids use
+#     models_root/<ozone_generalized_id>/<model_filename> for O3 only.
+#     CO/NO/NO2/CO2 are unchanged.
 #
 # - PM2.5 model:
 #     Toggle whether to use generalized PM via pm_use_generalized.
@@ -36,7 +42,7 @@
 # - drop_negative_values = FALSE: keeps negative values in output.
 #
 # Notes:
-# - "model_path" and "pm_model_path" may be either:
+# - "model_path", "ozone_model_path", and "pm_model_path" may be either:
 #     (a) a full file path to Calibration_Models.obj, OR
 #     (b) a folder path containing Calibration_Models.obj
 
@@ -56,6 +62,14 @@ suppressPackageStartupMessages({
 default_in_root     <- file.path("..", "apply_calibrations", "apply_calibrations_joined_downsampled_data")
 default_out_root    <- file.path("..", "apply_calibrations", "apply_calibrations_calibrated_data")
 default_models_root <- file.path("..", "calibration_models")  # folder containing <id>/Calibration_Models.obj
+
+# Sensors that should use the generalized O3 model only.
+# Other gas pollutants still use the normal gas model selection.
+default_ozone_generalized_sensor_ids <- c(
+  "2020", "2044", "2037", "2026", "2049",
+  "2035", "2045", "2027", "2029", "2038",
+  "2028", "2036", "2046", "2047", "2048"
+)
 
 # ---- CAPS core loader --------------------------------------------------------
 .ensure_caps_loaded <- function(caps_core_path = "caps_core.R") {
@@ -97,6 +111,34 @@ default_models_root <- file.path("..", "calibration_models")  # folder containin
   
   use_id <- if (isTRUE(generalized_model)) generalized_id else sensor_id
   file.path(models_root, use_id, model_filename)
+}
+
+# ---- resolve model path (O3 only) -------------------------------------------
+.resolve_ozone_model_path <- function(sensor_id,
+                                      gas_model_path,
+                                      ozone_use_generalized_sensor_ids = default_ozone_generalized_sensor_ids,
+                                      models_root,
+                                      ozone_generalized_id = "2032",
+                                      model_filename = "Calibration_Models.obj",
+                                      ozone_model_path = NULL) {
+  
+  # explicit O3 override: file OR folder
+  op <- .as_model_file(ozone_model_path, model_filename)
+  if (!is.null(op) && nzchar(op)) return(op)
+  
+  # listed sensors use generalized O3 only
+  if (sensor_id %in% as.character(ozone_use_generalized_sensor_ids)) {
+    if (is.null(models_root) || !nzchar(models_root)) {
+      stop("Generalized O3 override requires models_root=... or ozone_model_path=...")
+    }
+    if (file.exists(models_root) && !dir.exists(models_root)) {
+      return(models_root)
+    }
+    return(file.path(models_root, ozone_generalized_id, model_filename))
+  }
+  
+  # all other sensors use exactly the same model as the other gases
+  gas_model_path
 }
 
 # ---- resolve model path (PM) -------------------------------------------------
@@ -166,7 +208,7 @@ default_models_root <- file.path("..", "calibration_models")  # folder containin
 
 # ---- model structure assertions ----------------------------------------------
 .assert_gas_models <- function(gas_models, model_path_for_msg = "<unknown>") {
-  need <- c("NO2", "NO", "CO2", "O3", "CO")
+  need <- c("NO2", "NO", "CO2", "CO")
   if (is.null(gas_models$gas$Hybrid)) {
     stop("Gas model object does not contain gas$Hybrid as expected.\nModel path: ", model_path_for_msg)
   }
@@ -174,6 +216,13 @@ default_models_root <- file.path("..", "calibration_models")  # folder containin
   if (length(miss) > 0) {
     stop("Gas model missing Hybrid entries: ", paste(miss, collapse = ", "),
          "\nModel path: ", model_path_for_msg)
+  }
+  invisible(TRUE)
+}
+
+.assert_ozone_model <- function(ozone_models, model_path_for_msg = "<unknown>") {
+  if (is.null(ozone_models$gas$Hybrid$O3)) {
+    stop("O3 model object does not contain gas$Hybrid$O3 as expected.\nModel path: ", model_path_for_msg)
   }
   invisible(TRUE)
 }
@@ -238,10 +287,12 @@ default_models_root <- file.path("..", "calibration_models")  # folder containin
 }
 
 # ---- apply RAMP calibration (gas + PM2.5) -----------------------------------
-.apply_ramp_caps_calibration <- function(df, gas_models, pm_models,
+.apply_ramp_caps_calibration <- function(df, gas_models, ozone_models, pm_models,
                                          gas_model_path_for_msg = "<gas>",
+                                         ozone_model_path_for_msg = "<ozone>",
                                          pm_model_path_for_msg = "<pm>") {
   .assert_gas_models(gas_models, gas_model_path_for_msg)
+  .assert_ozone_model(ozone_models, ozone_model_path_for_msg)
   .assert_pm_models(pm_models, pm_model_path_for_msg)
   
   df_clean <- df %>% select(date, CO, NO, NO2, O3, CO2, T, RH, `PM2.5`)
@@ -272,7 +323,7 @@ default_models_root <- file.path("..", "calibration_models")  # folder containin
     NO2  = as.numeric(CAPS_Hybrid_Apply(gas_models$gas$Hybrid$NO2, gas_mat)),
     NO   = as.numeric(CAPS_Hybrid_Apply(gas_models$gas$Hybrid$NO,  gas_mat)),
     CO2  = as.numeric(CAPS_Hybrid_Apply(gas_models$gas$Hybrid$CO2, gas_mat)),
-    O3   = as.numeric(CAPS_Hybrid_Apply(gas_models$gas$Hybrid$O3,  gas_mat)),
+    O3   = as.numeric(CAPS_Hybrid_Apply(ozone_models$gas$Hybrid$O3, gas_mat)),
     CO   = as.numeric(CAPS_Hybrid_Apply(gas_models$gas$Hybrid$CO,  gas_mat))
   )
   
@@ -291,6 +342,10 @@ ramp_apply_calibration <- function(sensor_ids,
                                    generalized_id      = "2032",
                                    model_filename      = "Calibration_Models.obj",
                                    model_path          = NULL,   # gas override: file OR folder for all sensors
+                                   # O3-only generalized override:
+                                   ozone_use_generalized_sensor_ids = default_ozone_generalized_sensor_ids,
+                                   ozone_generalized_id = "2032",
+                                   ozone_model_path     = NULL,   # O3 override: file OR folder for all sensors
                                    # PM model selection:
                                    pm_use_generalized  = TRUE,
                                    pm_generalized_id   = "2032",
@@ -322,126 +377,153 @@ ramp_apply_calibration <- function(sensor_ids,
     }
     
     tryCatch({
-    
-    sensor_dir <- file.path(in_root, id)
-    if (!dir_exists(sensor_dir)) {
-      warning("Sensor dir does not exist for ", id, ": ", sensor_dir)
-      next
-    }
-    
-    files <- dir_ls(sensor_dir, type = "file", glob = "*.csv")
-    if (!length(files)) {
-      warning("No CSV files found for ", id, " in ", sensor_dir)
-      next
-    }
-    
-    # ---- resolve/load gas model ---------------------------------------------
-    gas_path <- .resolve_gas_model_path(
-      sensor_id         = id,
-      generalized_model = generalized_model,
-      models_root       = models_root,
-      generalized_id    = generalized_id,
-      model_filename    = model_filename,
-      model_path        = model_path
-    )
-    if (verbose) message("→ Using gas model: ", gas_path)
-    gas_models <- .load_calibration_models_cached(gas_path)
-    
-    # ---- resolve/load PM model ----------------------------------------------
-    pm_path <- .resolve_pm_model_path(
-      sensor_id          = id,
-      pm_use_generalized = pm_use_generalized,
-      generalized_model  = generalized_model,
-      models_root        = models_root,
-      generalized_id     = generalized_id,
-      pm_generalized_id  = pm_generalized_id,
-      model_filename     = model_filename,
-      model_path         = model_path,
-      pm_model_path      = pm_model_path
-    )
-    if (verbose) {
-      msg_kind <- if (!is.null(pm_model_path) && nzchar(pm_model_path)) "forced"
-      else if (isTRUE(pm_use_generalized)) "generalized"
-      else if (!is.null(model_path) && nzchar(model_path)) "same-as-gas (forced)"
-      else "matched-to-gas-selection"
-      message("→ Using PM model (", msg_kind, "): ", pm_path)
-      message("→ Drop negative values: ", if (isTRUE(drop_negative_values)) "TRUE" else "FALSE")
-    }
-    pm_models <- .load_calibration_models_cached(pm_path)
-    
-    out_dir <- file.path(out_root, id)
-    dir_create(out_dir)
-    
-    for (f in files) {
-      base <- path_ext_remove(path_file(f))
-      out_file <- file.path(out_dir, paste0(base, "_pred.csv"))
       
-      if (file_exists(out_file) && !overwrite) {
-        if (verbose) message("Exists (skipped): ", out_file)
+      sensor_dir <- file.path(in_root, id)
+      if (!dir_exists(sensor_dir)) {
+        warning("Sensor dir does not exist for ", id, ": ", sensor_dir)
         next
       }
       
-      if (verbose) message("→ Reading: ", path_file(f))
-      df <- .read_one_ramp_ds(f, tz_in = tz_in)
-      if (is.null(df) || !nrow(df)) {
-        if (verbose) message("  (no usable rows)")
+      files <- dir_ls(sensor_dir, type = "file", glob = "*.csv")
+      if (!length(files)) {
+        warning("No CSV files found for ", id, " in ", sensor_dir)
         next
       }
       
-      if (verbose) message("→ Applying RAMP CAPS calibration (gas + PM2.5) …")
-      pred <- .apply_ramp_caps_calibration(
-        df,
-        gas_models = gas_models,
-        pm_models  = pm_models,
-        gas_model_path_for_msg = gas_path,
-        pm_model_path_for_msg  = pm_path
+      # ---- resolve/load gas model ---------------------------------------------
+      gas_path <- .resolve_gas_model_path(
+        sensor_id         = id,
+        generalized_model = generalized_model,
+        models_root       = models_root,
+        generalized_id    = generalized_id,
+        model_filename    = model_filename,
+        model_path        = model_path
       )
+      if (verbose) message("→ Using gas model for CO/NO/NO2/CO2: ", gas_path)
+      gas_models <- .load_calibration_models_cached(gas_path)
       
-      pred_out <- pred %>%
-        left_join(
-          df %>% select(date, T, RH, WD, WS),
-          by = "date"
-        ) %>%
-        mutate(DATE = format(with_tz(date, tz_out), "%m/%d/%Y %H:%M")) %>%
-        { 
-          base <- select(., DATE, CO, NO, NO2, O3, CO2, PM2_5, T, RH)
-          wind_cols <- intersect(c("WD", "WS"), names(.))
-          wind_present <- length(wind_cols) == 2 &&
-            !all(is.na(.[["WD"]])) && !all(is.na(.[["WS"]]))
-          if (wind_present) bind_cols(base, select(., all_of(wind_cols))) else base
-        }
+      # ---- resolve/load O3 model ----------------------------------------------
+      ozone_path <- .resolve_ozone_model_path(
+        sensor_id = id,
+        gas_model_path = gas_path,
+        ozone_use_generalized_sensor_ids = ozone_use_generalized_sensor_ids,
+        models_root = models_root,
+        ozone_generalized_id = ozone_generalized_id,
+        model_filename = model_filename,
+        ozone_model_path = ozone_model_path
+      )
+      ozone_uses_generalized <- (
+        isTRUE(generalized_model) ||
+          ((is.null(ozone_model_path) || !nzchar(ozone_model_path)) &&
+             id %in% as.character(ozone_use_generalized_sensor_ids))
+      )
+      if (verbose) {
+        msg_kind <- if (!is.null(ozone_model_path) && nzchar(ozone_model_path)) "forced"
+        else if (id %in% as.character(ozone_use_generalized_sensor_ids)) "generalized"
+        else "same-as-gas"
+        message("→ Using O3 model (", msg_kind, "): ", ozone_path)
+      }
+      ozone_models <- .load_calibration_models_cached(ozone_path)
       
-      if (isTRUE(drop_negative_values)) {
-        pred_out <- .drop_negative_rows(
-          pred_out,
-          cols = c("CO", "NO", "NO2", "O3", "CO2", "PM2_5"),
-          verbose = verbose
-        )
+      # ---- resolve/load PM model ----------------------------------------------
+      pm_path <- .resolve_pm_model_path(
+        sensor_id          = id,
+        pm_use_generalized = pm_use_generalized,
+        generalized_model  = generalized_model,
+        models_root        = models_root,
+        generalized_id     = generalized_id,
+        pm_generalized_id  = pm_generalized_id,
+        model_filename     = model_filename,
+        model_path         = model_path,
+        pm_model_path      = pm_model_path
+      )
+      if (verbose) {
+        msg_kind <- if (!is.null(pm_model_path) && nzchar(pm_model_path)) "forced"
+        else if (isTRUE(pm_use_generalized)) "generalized"
+        else if (!is.null(model_path) && nzchar(model_path)) "same-as-gas (forced)"
+        else "matched-to-gas-selection"
+        message("→ Using PM model (", msg_kind, "): ", pm_path)
+        message("→ Drop negative values: ", if (isTRUE(drop_negative_values)) "TRUE" else "FALSE")
+      }
+      pm_models <- .load_calibration_models_cached(pm_path)
+      
+      out_dir <- file.path(out_root, id)
+      dir_create(out_dir)
+      
+      for (f in files) {
+        base <- path_ext_remove(path_file(f))
+        out_file <- file.path(out_dir, paste0(base, "_pred.csv"))
         
-        if (!nrow(pred_out)) {
-          warning("All rows dropped after negative-value filtering for: ", id, " / ", path_file(f))
+        if (file_exists(out_file) && !overwrite) {
+          if (verbose) message("Exists (skipped): ", out_file)
           next
         }
+        
+        if (verbose) message("→ Reading: ", path_file(f))
+        df <- .read_one_ramp_ds(f, tz_in = tz_in)
+        if (is.null(df) || !nrow(df)) {
+          if (verbose) message("  (no usable rows)")
+          next
+        }
+        
+        if (verbose) message("→ Applying RAMP CAPS calibration (gas + PM2.5) …")
+        pred <- .apply_ramp_caps_calibration(
+          df,
+          gas_models = gas_models,
+          ozone_models = ozone_models,
+          pm_models  = pm_models,
+          gas_model_path_for_msg = gas_path,
+          ozone_model_path_for_msg = ozone_path,
+          pm_model_path_for_msg  = pm_path
+        )
+        
+        pred_out <- pred %>%
+          left_join(
+            df %>% select(date, T, RH, WD, WS),
+            by = "date"
+          ) %>%
+          mutate(DATE = format(with_tz(date, tz_out), "%m/%d/%Y %H:%M")) %>%
+          { 
+            base <- select(., DATE, CO, NO, NO2, O3, CO2, PM2_5, T, RH)
+            wind_cols <- intersect(c("WD", "WS"), names(.))
+            wind_present <- length(wind_cols) == 2 &&
+              !all(is.na(.[["WD"]])) && !all(is.na(.[["WS"]]))
+            if (wind_present) bind_cols(base, select(., all_of(wind_cols))) else base
+          }
+        
+        if (isTRUE(drop_negative_values)) {
+          pred_out <- .drop_negative_rows(
+            pred_out,
+            cols = c("CO", "NO", "NO2", "O3", "CO2", "PM2_5"),
+            verbose = verbose
+          )
+          
+          if (!nrow(pred_out)) {
+            warning("All rows dropped after negative-value filtering for: ", id, " / ", path_file(f))
+            next
+          }
+        }
+        
+        write_csv(pred_out, out_file, na = "")
+        if (verbose) message("Wrote: ", out_file)
+        
+        results[[length(results) + 1]] <- list(
+          sensor_id            = id,
+          in_file              = f,
+          out_file             = out_file,
+          rows                 = nrow(pred_out),
+          gas_model_path       = gas_path,
+          ozone_model_path     = ozone_path,
+          pm_model_path        = pm_path,
+          generalized_model    = generalized_model,
+          ozone_uses_generalized = ozone_uses_generalized,
+          pm_use_generalized   = pm_use_generalized,
+          drop_negative_values = drop_negative_values,
+          tz_in                = tz_in,
+          tz_out               = tz_out
+        )
       }
       
-      write_csv(pred_out, out_file, na = "")
-      if (verbose) message("Wrote: ", out_file)
-      
-      results[[length(results) + 1]] <- list(
-        sensor_id            = id,
-        in_file              = f,
-        out_file             = out_file,
-        rows                 = nrow(pred_out),
-        gas_model_path       = gas_path,
-        pm_model_path        = pm_path,
-        generalized_model    = generalized_model,
-        pm_use_generalized   = pm_use_generalized,
-        drop_negative_values = drop_negative_values,
-        tz_in                = tz_in,
-        tz_out               = tz_out
-      )
-    }
-    
     }, error = function(e) {
       warning("SKIPPED sensor ", id, " due to error: ", conditionMessage(e))
     })
@@ -458,6 +540,15 @@ ramp_apply_calibration <- function(sensor_ids,
     default
   }
   
+  parse_csv <- function(x) {
+    if (is.null(x) || is.na(x) || !nzchar(x) || tolower(x) %in% c("none", "false", "no")) {
+      return(character(0))
+    }
+    strsplit(x, ",", fixed = TRUE)[[1]] |>
+      str_trim() |>
+      (\(y) y[nzchar(y)])()
+  }
+  
   sensors_raw <- get_flag("--sensors", NA_character_)
   if (is.na(sensors_raw)) stop("Missing --sensors (comma-separated), e.g. --sensors 2021,2040")
   
@@ -470,17 +561,24 @@ ramp_apply_calibration <- function(sensor_ids,
   drop_neg_raw <- get_flag("--drop-negatives", "TRUE")
   drop_neg_val <- tolower(drop_neg_raw) %in% c("true", "t", "1", "yes", "y")
   
+  ozone_gen_sensors_raw <- get_flag(
+    "--ozone-generalized-sensors",
+    paste(default_ozone_generalized_sensor_ids, collapse = ",")
+  )
+  
   # convenience switch overrides everything else
   if ("--keep-negatives" %in% args) drop_neg_val <- FALSE
   
   list(
-    sensors            = strsplit(sensors_raw, ",", fixed = TRUE)[[1]] |>
-      str_trim() |> (\(x) x[nzchar(x)])(),
+    sensors            = parse_csv(sensors_raw),
     model              = get_flag("--model", NULL),       # gas: file OR folder
+    ozone_model        = get_flag("--ozone-model", NULL), # O3: file OR folder
     pm_model           = get_flag("--pm-model", NULL),    # pm: file OR folder
     models_root        = get_flag("--models-root", default_models_root),
     generalized        = generalized_val,
     generalized_id     = get_flag("--generalized-id", "2032"),
+    ozone_generalized_sensors = parse_csv(ozone_gen_sensors_raw),
+    ozone_generalized_id = get_flag("--ozone-generalized-id", "2032"),
     pm_use_generalized = pm_gen_val,
     pm_generalized_id  = get_flag("--pm-generalized-id", "2032"),
     drop_negatives     = drop_neg_val,
@@ -509,6 +607,9 @@ if (identical(environmentName(environment()), "R_GlobalEnv") && !interactive() &
     generalized_id      = a$generalized_id,
     model_filename      = a$model_filename,
     model_path          = a$model,
+    ozone_use_generalized_sensor_ids = a$ozone_generalized_sensors,
+    ozone_generalized_id = a$ozone_generalized_id,
+    ozone_model_path    = a$ozone_model,
     pm_use_generalized  = a$pm_use_generalized,
     pm_generalized_id   = a$pm_generalized_id,
     pm_model_path       = a$pm_model,
