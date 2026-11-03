@@ -311,8 +311,10 @@ Invoke-Step "Calibrate" {
 
 # ---------------------------------------------------------------------------
 # 4. Build monthly CSV and upload to Cloudflare R2
+#    Non-fatal: R2 outages should not block dashboard updates.
 # ---------------------------------------------------------------------------
-Invoke-Step "Upload to R2" {
+Log-Info "START Upload to R2"
+try {
     & $CFG.PythonExe "$($CFG.PipelineDir)\upload_to_r2.py" `
         --calibrated-dir $CFG.CalibratedDir `
         --publish-dir    $CFG.PublishDir `
@@ -320,6 +322,13 @@ Invoke-Step "Upload to R2" {
         --endpoint       $CFG.R2Endpoint `
         --month          $Month `
         --no-merge
+    if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) {
+        Log-Warn "Upload to R2 failed (exit $LASTEXITCODE) - pipeline continues"
+    } else {
+        Log-Info "OK Upload to R2"
+    }
+} catch {
+    Log-Warn "Upload to R2 error: $_ - pipeline continues"
 }
 
 # ---------------------------------------------------------------------------

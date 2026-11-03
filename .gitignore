@@ -3,3 +3,7 @@ data/
 logs/
 backfill/
 
+
+/ssh/dashboard_local_deploy
+
+/ssh/elusive_deploy
